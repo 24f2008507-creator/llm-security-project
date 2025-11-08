@@ -1,0 +1,17 @@
+{
+  "name": "quiz-solver-api",
+  "version": "1.0.0",
+  "description": "API endpoint to solve the LLM data analysis quiz.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "puppeteer": "^22.12.1"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
