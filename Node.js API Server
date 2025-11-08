@@ -1,0 +1,298 @@
+/*
+* This is your Node.js backend server.
+* You must deploy this to a platform like Vercel, Render, or Google Cloud Functions.
+* This code IS NOT for GitHub Pages.
+*/
+
+// 1. Import necessary libraries
+// You will need to install these: npm install express puppeteer node-fetch
+const express = require('express');
+const puppeteer = require('puppeteer');
+const fetch = require('node-fetch');
+
+// --- CONFIGURATION ---
+// !! IMPORTANT: Set your secret in an environment variable, not here.
+const MY_SECRET = process.env.YOUR_SECRET_ENV_VARIABLE || "your secret";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || ""; // Add your Gemini API Key
+const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${GEMINI_API_KEY}`;
+// ---------------------
+
+// 2. Initialize Express app
+const app = express();
+// Use express.json() to automatically parse JSON request bodies
+app.use(express.json({ limit: '1mb' })); // Set 1MB limit as per spec
+
+// 3. Create the main API endpoint
+/**
+ * Main endpoint to receive quiz tasks.
+ * It will respond with 200 OK immediately and then
+ * start the quiz-solving logic asynchronously.
+ */
+app.post('/api/solve', (req, res) => {
+    try {
+        const { email, secret, url } = req.body;
+
+        // 4. --- Security and Validation ---
+        if (!email || !secret || !url) {
+            console.warn("Validation failed: Missing fields.");
+            return res.status(400).json({ error: "Invalid JSON. 'email', 'secret', and 'url' are required." });
+        }
+
+        if (secret !== MY_SECRET) {
+            console.warn(`Auth failed: Invalid secret from ${email}.`);
+            return res.status(403).json({ error: "Invalid secret." });
+        }
+
+        // 5. --- Acknowledge Request Immediately ---
+        // Respond with HTTP 200 *before* starting the long process.
+        // This is crucial to meet the 3-minute timeout.
+        res.status(200).json({ status: "accepted", message: "Quiz task received. Processing..." });
+
+        // 6. --- Start Asynchronous Quiz Solving ---
+        // We run this *after* sending the response.
+        console.log(`Task accepted for ${email}. Starting to solve ${url}`);
+        
+        // Use a self-invoking async function to handle the logic
+        // without holding up the response.
+        (async () => {
+            try {
+                // We pass all necessary info to the solving function.
+                await solveQuizChain(url, email, secret);
+            } catch (error) {
+                console.error(`[FATAL] Error in solveQuizChain for ${email}:`, error);
+                // This error happens "in the background".
+                // You would typically log this to a monitoring service.
+            }
+        })();
+
+    } catch (error) {
+        // This catches errors in the *initial* request parsing.
+        console.error("Error in /api/solve handler:", error);
+        // We check if headers are already sent, just in case.
+        if (!res.headersSent) {
+            res.status(500).json({ error: "Internal server error." });
+        }
+    }
+});
+
+/**
+ * This function handles the entire quiz-solving chain.
+ * It will visit a URL, solve, submit, and if it gets a new URL,
+ * it will call itself recursively.
+ */
+async function solveQuizChain(quizUrl, email, secret) {
+    console.log(`[${email}] Starting to solve: ${quizUrl}`);
+
+    // --- 1. Scrape the Quiz Page ---
+    const pageData = await scrapeQuizPage(quizUrl);
+    if (!pageData) {
+        console.error(`[${email}] Failed to scrape page data from ${quizUrl}. Ending chain.`);
+        return;
+    }
+    
+    // We now have the question and the URL to submit the answer to.
+    const { question, submitUrl } = pageData;
+    console.log(`[${email}] Found question: ${question.substring(0, 100)}...`);
+    console.log(`[${email}] Found submit URL: ${submitUrl}`);
+
+    // --- 2. Solve the Question using AI ---
+    // This is the core data analysis part.
+    // The 'question' might contain raw data, links, or instructions.
+    const answer = await getAnswerFromLLM(question);
+    console.log(`[${email}] AI generated answer:`, answer);
+    
+    // --- 3. Submit the Answer ---
+    const payload = {
+        email,
+        secret,
+        url: quizUrl,
+        answer: answer 
+    };
+
+    console.log(`[${email}] Submitting answer to ${submitUrl}...`);
+    const response = await fetch(submitUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+
+    const result = await response.json();
+    console.log(`[${email}] Submission result:`, result);
+
+    // --- 4. Handle the Result (Looping) ---
+    if (result.correct === true && result.url) {
+        // Correct, and new quiz URL given
+        console.log(`[${email}] Correct! Proceeding to next quiz: ${result.url}`);
+        // Call itself to solve the next quiz in the chain.
+        await solveQuizChain(result.url, email, secret);
+    } else if (result.correct === false && result.url) {
+        // Incorrect, but new URL given (as per spec)
+        console.warn(`[${email}] Incorrect. Reason: ${result.reason}. Skipping to next quiz: ${result.url}`);
+        await solveQuizChain(result.url, email, secret);
+    } else if (result.correct === true && !result.url) {
+        // Correct, and NO new URL given
+        console.log(`[${email}] Correct! Quiz chain finished.`);
+    } else if (result.correct === false && !result.url) {
+        // Incorrect, and NO new URL given
+        console.error(`[${email}] Incorrect. Reason: ${result.reason}. No new URL. Ending chain.`);
+        // Here you *could* re-try if you have time, but for now we stop.
+    }
+}
+
+/**
+ * Uses a headless browser (Puppeteer) to visit a URL,
+ * execute JavaScript, and extract content.
+ *
+ * This function needs to be VERY robust.
+ */
+async function scrapeQuizPage(url) {
+    let browser;
+    try {
+        // Launch Puppeteer.
+        // `headless: 'new'` is the modern way.
+        // '--no-sandbox' is often required in serverless environments.
+        browser = await puppeteer.launch({ 
+            headless: 'new',
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+        });
+        
+        const page = await browser.newPage();
+        await page.goto(url, { waitUntil: 'networkidle0' });
+
+        // This is a *sample* parser based on the spec's example.
+        // You WILL need to make this much smarter.
+        const quizData = await page.evaluate(() => {
+            // Find the element with the quiz question.
+            // This assumes it's in an element with id 'result' like the sample.
+            // In a real quiz, you'd need to find the question text.
+            const questionElement = document.body; // Just grab the whole body
+            const questionText = questionElement ? questionElement.innerText : null;
+
+            // Find the submission URL.
+            // This is a simple regex to find a URL.
+            const urlRegex = /https?:\/\/[^\s"'<>()]+submit[^\s"'<>()]*/;
+            const match = questionText ? questionText.match(urlRegex) : null;
+            const submitUrl = match ? match[0] : null;
+
+            return {
+                question: questionText,
+                submitUrl: submitUrl
+            };
+        });
+
+        if (!quizData.question || !quizData.submitUrl) {
+            console.error(`Could not parse question or submit URL from ${url}.`);
+            return null;
+        }
+
+        return quizData;
+
+    } catch (error) {
+        console.error(`Error in scrapeQuizPage for ${url}:`, error);
+        return null;
+    } finally {
+        if (browser) {
+            await browser.close();
+        }
+    }
+}
+
+/**
+ * Sends the scraped quiz text to Gemini to get a structured answer.
+ * This is where the "data sourcing, prep, analysis" happens.
+ */
+async function getAnswerFromLLM(fullQuizText) {
+    // This system prompt is CRITICAL.
+    // It tells the LLM to act as an agent, parse the text,
+    // and perform the required steps.
+    const systemPrompt = `You are an AI data analysis agent. You will be given the text content of a quiz page.
+Your task is to:
+1.  Read the entire text and identify the question.
+2.  The text may contain data (like in a <pre> tag), links to files (PDFs, APIs), or instructions.
+3.  Perform ALL necessary steps to answer the question. This may involve:
+    a.  Sourcing data (if a URL is provided, state what you'd fetch).
+    b.  Parsing and cleaning the data.
+    c.  Analyzing the data (aggregating, summing, filtering).
+    d.  Visualizing (if asked, provide a base64 image or Chart.js JSON).
+4.  Formulate the final answer. The answer might be a number, a string, a boolean, or a JSON object.
+5.  Respond ONLY with the final answer, and nothing else. Do not explain your steps.
+
+Example:
+If the question is "What is the sum of the 'value' column?" and the text contains a table,
+you will find the 'value' column, sum the numbers, and respond with ONLY the final number.
+e.g., 12345
+
+If the question is "Who is the CEO?", find the name.
+e.g., "Jane Doe"
+`;
+
+    const payload = {
+        "systemInstruction": {
+            "parts": [{ "text": systemPrompt }]
+        },
+        "contents": [{
+            "parts": [{ "text": fullQuizText }]
+        }],
+        "generationConfig": {
+            "maxOutputTokens": 2048,
+            "temperature": 0.0 // We want deterministic answers
+        }
+    };
+
+    // NOTE: This simple version just sends the text.
+    // A truly robust bot would need to:
+    // 1. Ask the LLM *what to do* (e.g., "fetch this URL").
+    // 2. Your code would fetch the URL.
+    // 3. You'd send the *new data* back to the LLM.
+    // This is a "ReAct" or "Agent" loop.
+    // For now, we hope the LLM can answer from the text alone.
+    
+    try {
+        const response = await fetch(GEMINI_API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            throw new Error(`Gemini API Error: ${response.statusText}`);
+        }
+
+        const result = await response.json();
+        const answerText = result.candidates[0].content.parts[0].text;
+        
+        // The LLM might return a number as a string, e.g., "12345".
+        // We try to parse it as a number or boolean if it looks like one.
+        if (!isNaN(answerText)) {
+            return Number(answerText);
+        }
+        if (answerText.toLowerCase() === 'true') {
+            return true;
+        }
+        if (answerText.toLowerCase() === 'false') {
+            return false;
+        }
+        // Otherwise, return the text as-is.
+        return answerText.trim();
+        
+    } catch (error) {
+        console.error("Error in getAnswerFromLLM:", error);
+        return `Error: ${error.message}`; // Return an error as the answer
+    }
+}
+
+
+// --- 7. Start the server ---
+// This is for local testing.
+// Serverless platforms will auto-start this file.
+if (process.env.NODE_ENV !== 'production') {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+        console.log(`Server listening on http://localhost:${PORT}`);
+        console.log(`Test with:`);
+        console.log(`curl -X POST http://localhost:${PORT}/api/solve -H "Content-Type: application/json" -d '{"email": "test@example.com", "secret": "your secret", "url": "https://tds-llm-analysis.s-anand.net/demo"}'`);
+    });
+}
+
+// This line is often needed for Vercel deployment
+module.exports = app;
