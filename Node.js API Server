@@ -285,14 +285,6 @@ e.g., "Jane Doe"
 // --- 7. Start the server ---
 // This is for local testing.
 // Serverless platforms will auto-start this file.
-if (process.env.NODE_ENV !== 'production') {
-    const PORT = process.env.PORT || 3000;
-    app.listen(PORT, () => {
-        console.log(`Server listening on http://localhost:${PORT}`);
-        console.log(`Test with:`);
-        console.log(`curl -X POST http://localhost:${PORT}/api/solve -H "Content-Type: application/json" -d '{"email": "test@example.com", "secret": "your secret", "url": "https://tds-llm-analysis.s-anand.net/demo"}'`);
-    });
-}
-
+module.exports = app;
 // This line is often needed for Vercel deployment
 module.exports = app;
