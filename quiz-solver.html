@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-gray-900">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Quiz Solver (Data Pipeline)</title>
+    <!-- 1. Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 2. Load Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Simple spinner animation */
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .spinner {
+            border: 4px solid rgba(255, 255, 255, 0.2);
+            border-left-color: #34d399; /* emerald-400 */
+            border-radius: 50%;
+            width: 2rem;
+            height: 2rem;
+            animation: spin 1s linear infinite;
+        }
+    </style>
+</head>
+<body class="h-full p-4 md:p-8 bg-gray-900 text-gray-100">
+
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-3xl md:text-4xl font-bold text-center text-white mb-2">
+            AI Quiz Solver
+        </h1>
+        <p class="text-center text-gray-400 mb-8">
+            An LLM-powered data pipeline: Sourcing &rarr; Analysis &rarr; Visualization
+        </p>
+
+        <!-- Input Section -->
+        <div class="bg-gray-800 rounded-xl shadow-2xl p-6 mb-6">
+            <label for="quiz-prompt" class="block text-sm font-medium text-gray-300 mb-2">
+                Enter Data-Related Quiz Question:
+            </label>
+            <textarea
+                id="quiz-prompt"
+                class="w-full h-24 p-3 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                placeholder="e.g., What are the populations of the 3 largest cities in France? Show me a bar chart."
+            ></textarea>
+            <button
+                id="solve-button"
+                class="w-full mt-4 bg-emerald-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md hover:bg-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 focus:ring-offset-gray-800 transition-all duration-200"
+            >
+                Solve Quiz
+            </button>
+        </div>
+
+        <!-- Results Section -->
+        <div id="results-container" class="hidden mt-6">
+            <!-- Loading Spinner -->
+            <div id="loading-spinner" class="hidden flex justify-center items-center p-8">
+                <div class="spinner"></div>
+                <p class="ml-4 text-gray-400 text-lg">Solving...</p>
+            </div>
+            
+            <!-- Error Message -->
+            <div id="error-message" class="hidden p-4 bg-red-800 text-red-100 rounded-lg">
+                <h3 class="font-bold">Error</h3>
+                <p id="error-text"></p>
+            </div>
+
+            <!-- Result Display -->
+            <div id="result-display" class="hidden space-y-6">
+                
+                <!-- Analysis -->
+                <div class="bg-gray-800 rounded-xl shadow-2xl p-6">
+                    <h2 class="text-2xl font-semibold text-emerald-400 mb-4">
+                        Analysis
+                    </h2>
+                    <p id="analysis-text" class="text-gray-300 whitespace-pre-wrap"></p>
+                </div>
+
+                <!-- Visualization -->
+                <div class="bg-gray-800 rounded-xl shadow-2xl p-6">
+                    <h2 class="text-2xl font-semibold text-emerald-400 mb-4">
+                        Visualization
+                    </h2>
+                    <div class="bg-white p-4 rounded-lg">
+                        <canvas id="chart-canvas"></canvas>
+                    </div>
+                </div>
+                
+                <!-- Data Sourcing -->
+                <div class="bg-gray-800 rounded-xl shadow-2xl p-6">
+                    <h2 class="text-2xl font-semibold text-emerald-400 mb-4">
+                        Data Sources
+                    </h2>
+                    <p class="text-sm text-gray-400 mb-4">
+                        The analysis was grounded in the following real-time web sources:
+                    </p>
+                    <ul id="sources-list" class="space-y-2">
+                        <!-- Sources will be injected here -->
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- DOM Elements ---
+        const quizPromptEl = document.getElementById('quiz-prompt');
+        const solveButton = document.getElementById('solve-button');
+        const resultsContainer = document.getElementById('results-container');
+        const loadingSpinner = document.getElementById('loading-spinner');
+        const errorDisplay = document.getElementById('error-message');
+        const errorText = document.getElementById('error-text');
+        const resultDisplay = document.getElementById('result-display');
+        const analysisText = document.getElementById('analysis-text');
+        const sourcesList = document.getElementById('sources-list');
+        const chartCanvas = document.getElementById('chart-canvas');
+
+        // --- API Configuration ---
+        const apiKey = ""; // Leave as-is, will be populated by the environment
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+        // --- Chart.js State ---
+        let chartInstance = null;
+
+        // --- Event Listeners ---
+        solveButton.addEventListener('click', handleSolve);
+
+        // --- Core Logic ---
+
+        /**
+         * Handles the click event of the "Solve Quiz" button.
+         */
+        async function handleSolve() {
+            const userQuery = quizPromptEl.value;
+            if (!userQuery) {
+                showError("Please enter a quiz question.");
+                return;
+            }
+
+            // 1. Reset UI
+            resetUI();
+            loadingSpinner.classList.remove('hidden');
+
+            try {
+                // 2. Define the System Prompt
+                const systemPrompt = "You are a data analyst. Your job is to answer the user's question. You MUST provide a brief text analysis and the data for a chart. Use Google Search to find real-time data.";
+
+                // 3. Define the *exact* JSON schema we want the LLM to return
+                const responseSchema = {
+                    type: "OBJECT",
+                    properties: {
+                        "analysisText": { 
+                            type: "STRING",
+                            description: "A brief, 1-2 sentence analysis answering the user's question."
+                        },
+                        "chartType": {
+                            type: "STRING",
+                            description: "The type of Chart.js chart to use (e.g., 'bar', 'pie', 'line')."
+                        },
+                        "chartData": {
+                            type: "OBJECT",
+                            description: "A valid Chart.js data object based on the schema.",
+                            properties: {
+                                "labels": {
+                                    type: "ARRAY",
+                                    items: { type: "STRING" }
+                                },
+                                "datasets": {
+                                    type: "ARRAY",
+                                    items: {
+                                        type: "OBJECT",
+                                        properties: {
+                                            "label": { type: "STRING" },
+                                            "data": { 
+                                                type: "ARRAY",
+                                                items: { type: "NUMBER" }
+                                            }
+                                        },
+                                        required: ["label", "data"]
+                                    }
+                                }
+                            },
+                            required: ["labels", "datasets"]
+                        }
+                    },
+                    required: ["analysisText", "chartType", "chartData"]
+                };
+
+                // 4. Construct the API Payload
+                const payload = {
+                    "contents": [{ "parts": [{ "text": userQuery }] }],
+                    "systemInstruction": {
+                        "parts": [{ "text": systemPrompt }]
+                    },
+                    "tools": [
+                        // Tool 1: Enable Google Search for Data Sourcing
+                        { "google_search": {} }
+                    ],
+                    "generationConfig": {
+                        // Tool 2: Force JSON output for Data Prep/Analysis
+                        "responseMimeType": "application/json",
+                        "responseSchema": responseSchema
+                    }
+                };
+
+                // 5. Call API
+                const response = await exponentialBackoff(() => fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                }));
+
+                if (!response.ok) {
+                    const errorBody = await response.text();
+                    throw new Error(`API Error ${response.status}: ${errorBody}`);
+                }
+
+                const result = await response.json();
+                
+                // 6. Process the Response
+                const candidate = result.candidates?.[0];
+                if (!candidate) {
+                    throw new Error("No valid response candidate found.");
+                }
+
+                // Extract Grounding (Sourcing)
+                const sources = candidate.groundingMetadata?.groundingAttributions?.map(attr => ({
+                    title: attr.web?.title || "Unknown Title",
+                    uri: attr.web?.uri || "#"
+                })) || [];
+                
+                // Extract Structured Data (Analysis)
+                const jsonText = candidate.content?.parts?.[0]?.text;
+                if (!jsonText) {
+                    throw new Error("No JSON data returned from API.");
+                }
+                const structuredData = JSON.parse(jsonText);
+
+                // 7. Render the Pipeline
+                renderAnalysis(structuredData.analysisText);
+                renderSources(sources);
+                renderVisualization(structuredData.chartType, structuredData.chartData); // Visualization
+
+                // 8. Show results
+                resultDisplay.classList.remove('hidden');
+
+            } catch (error) {
+                console.error("Error during solve:", error);
+                showError(error.message);
+            } finally {
+                loadingSpinner.classList.add('hidden');
+                solveButton.disabled = false;
+            }
+        }
+        
+        // --- Rendering Functions ---
+
+        function renderAnalysis(text) {
+            analysisText.textContent = text;
+        }
+
+        function renderSources(sources) {
+            sourcesList.innerHTML = ''; // Clear old sources
+            if (sources.length === 0) {
+                sourcesList.innerHTML = '<li class="text-gray-400">No external web sources were used.</li>';
+                return;
+            }
+            
+            sources.forEach(source => {
+                const li = document.createElement('li');
+                li.innerHTML = `<a href="${source.uri}" target="_blank" rel="noopener noreferrer" class="text-emerald-400 hover:underline">${source.title}</a>`;
+                sourcesList.appendChild(li);
+            });
+        }
+
+        function renderVisualization(type, data) {
+            if (chartInstance) {
+                chartInstance.destroy(); // Destroy old chart
+            }
+            
+            chartInstance = new Chart(chartCanvas, {
+                type: type, // 'bar', 'pie', etc.
+                data: data, // The structured data from the LLM
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: {
+                            position: 'top',
+                        },
+                        title: {
+                            display: true,
+                            text: 'AI-Generated Chart'
+                        }
+                    }
+                }
+            });
+        }
+
+        // --- UI Utility Functions ---
+
+        function resetUI() {
+            solveButton.disabled = true;
+            resultsContainer.classList.remove('hidden');
+            loadingSpinner.classList.add('hidden');
+            resultDisplay.classList.add('hidden');
+            errorDisplay.classList.add('hidden');
+            errorText.textContent = '';
+            if (chartInstance) {
+                chartInstance.destroy();
+            }
+        }
+
+        function showError(message) {
+            errorText.textContent = message;
+            errorDisplay.classList.remove('hidden');
+        }
+
+        /**
+         * Implements exponential backoff for API calls.
+         */
+        async function exponentialBackoff(apiCallFunction, maxRetries = 5) {
+            let delay = 1000;
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await apiCallFunction();
+                    if (!response.ok && response.status === 429) {
+                        // Rate limit error, retry
+                        throw new Error("Rate limit exceeded");
+                    }
+                    return response; // Success
+                } catch (error) {
+                    if (i === maxRetries - 1) throw error; // Max retries reached
+                    // Don't log to console, just wait and retry
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay *= 2;
+                }
+            }
+        }
+
+    </script>
+</body>
+</html>
